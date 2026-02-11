@@ -1,0 +1,42 @@
+CompileFlags:
+  Add:
+    - -I/usr/local/cuda-13.1/include
+    - -I/usr/local/cuda-13.1/targets/x86_64-linux/include
+    - -I/home/wgreymon/Learning-CUDA/tester
+    - -I/home/wgreymon/Learning-CUDA/src
+    - -DPLATFORM_NVIDIA
+    - -D__CUDACC__
+    - -D__CUDACC_VER_MAJOR__=13
+    - -D__CUDACC_VER_MINOR__=1
+    - -D__CUDACC_VER_BUILD__=80
+    - -D__CUDA_ARCH__=800
+    - -D__host__=
+    - -D__device__=
+    - -D__global__=
+    - -D__shared__=
+    - -D__constant__=
+    - -D__restrict__=
+    - -D__forceinline__=
+    - -std=c++17
+    - -xc++
+  Remove:
+    - -W*
+    - -Werror*
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
+  Suppress:
+    - typename_nested_not_found
+    - ovl_no_oper
+    - typecheck_invalid_operands
+    - incomplete_type
+    - no_member
+  ClangTidy:
+    Add:
+      - readability-*
+    Remove:
+      - -*
+
+Index:
+  Background: Build

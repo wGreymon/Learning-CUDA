@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+test_kernels
+*.so
+*.a
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compile commands (optional - some prefer to commit this)
+# compile_commands.json
+
+# OS files
+.DS_Store
+Thumbs.db

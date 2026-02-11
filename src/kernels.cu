@@ -183,7 +183,7 @@ __global__ void flash_attention_kernel(
         const int kv_block_len = kv_end - kv_start;
         const double scale_d = static_cast<double>(scale);
         
-        // 内循环：加载当前KV tile到shared memory
+        // 内循环：加载当前KV tile[kv_block_len, head_dim]到shared memory
         for (int idx = tid; idx < kv_block_len * head_dim; idx += num_threads) {
             int kv_idx = idx / head_dim;
             int d_idx = idx % head_dim;
@@ -204,7 +204,7 @@ __global__ void flash_attention_kernel(
         }
         __syncthreads();
         
-        // 计算局部score
+        // 计算局部score：Qtile[q_block_len, head_dim] * Ktile^T[head_dim, kv_block_len] = Score[q_block_len, kv_block_len]
         for (int idx = tid; idx < q_block_len * kv_block_len; idx += num_threads) {
             int q_idx = idx / kv_block_len;
             int kv_idx = idx % kv_block_len;
@@ -217,7 +217,7 @@ __global__ void flash_attention_kernel(
                 continue;
             }
 
-            // 均使用float作为中间量，避免精度丢失
+            // 内层遍历整个head_dim，计算score
             float sum = 0.0;
             for (int d = 0; d < head_dim; d++) {
                 float q_val = static_cast<float>(q_shared[q_idx * head_dim + d]);
@@ -229,6 +229,7 @@ __global__ void flash_attention_kernel(
         __syncthreads();
         
         // ─────────────────────────────────────────────────────────────────
+        // softmax(Score[q_block_len, kv_block_len])
         // Online softmax：每处理一个 KV tile，增量更新 m/l/o
         // 流程：① 取当前 tile 的 max → ② 算 rescaling 因子 alpha
         //      ③ 累加 p_sum（softmax 分母）→ ④ 累加 o（softmax 分子 × V）
@@ -237,15 +238,15 @@ __global__ void flash_attention_kernel(
             int global_q_idx = q_start + q_idx;
 
             // ① 读取上一 tile 的状态
-            float m_old = static_cast<float>(m_shared[q_idx]);
-            float l_old = static_cast<float>(l_shared[q_idx]);
+            double m_old = m_shared[q_idx];
+            double l_old = l_shared[q_idx];
 
             // ② 当前 tile 内的 max
-            float m_ij = -static_cast<float>(INFINITY);
+            double m_ij = -static_cast<double>(INFINITY);
             for (int kv_idx = 0; kv_idx < kv_block_len; kv_idx++) {
                 int global_kv_idx = kv_start + kv_idx;
                 if (is_causal && global_q_idx < global_kv_idx) continue;
-                float s_val = s_shared[q_idx * block_size_kv + kv_idx];
+                double s_val = s_shared[q_idx * block_size_kv + kv_idx];
                 m_ij = fmax(m_ij, s_val);
             }
 
@@ -255,7 +256,7 @@ __global__ void flash_attention_kernel(
             // ③ rescaling 因子：max 变大时，旧值需整体缩小
             double alpha = exp(m_old - m_new);
 
-            // ④ 计算并缓存 p_ij = exp(s_ij - m_new)（类似 v2 的 sSafeE）
+            // ④ 计算并缓存 p_ij = exp(s_ij - m_new)
             //    然后复用 p_ij 同时完成分母 p_sum 的累加，避免在后续 O 累加里重复计算 exp()
             const int score_row = q_idx * block_size_kv;
             double p_sum = 0.0;
@@ -277,17 +278,22 @@ __global__ void flash_attention_kernel(
             }
 
             // ⑤ o_new = alpha * o_old + Σ p_ij * v，当前 tile 的输出贡献（Kahan 累加）
+            // 对于block_score[q_block_len, kv_block_len] * V[kv_block_len, head_dim]固定一个q_idx，计算[kv_block_len]列的贡献
+            // :即[kv_block_len] * V[kv_block_len, head_dim]
+            // 在最外层对kv维度进行了切分kv_block_idx < num_kv_blocks，多次累计，就能
             for (int d = 0; d < head_dim; d++) {
+                // 重标定：历史所有 tile 的分子从旧基准 m_old 统一“换算”到了新基准 m_new
                 double o_new_val = alpha * o_shared[q_idx * head_dim + d];
                 double o_err = 0.0;
+                // 把当前tile的新贡献累加到o_new_val中
                 for (int kv_idx = 0; kv_idx < kv_block_len; kv_idx++) {
                     const int global_kv_idx = kv_start + kv_idx;
                     if (is_causal && global_q_idx < global_kv_idx) continue;
                     // 复用缓存的 p_ij（已写回 s_shared）
-                    const double p_ij = s_shared[score_row + kv_idx];
+                    const double p_ij = s_shared[score_row + kv_idx];   // 已经是 exp(s_ij - m_new)
                     const double term = p_ij * static_cast<double>(v_shared[kv_idx * head_dim + d]);
                     const double y = term - o_err;
-                    const double t = o_new_val + y;
+                    const double t = o_new_val + y;      // 在历史的KV tile上累加，最终得到全局结果
                     o_err = (t - o_new_val) - y;
                     o_new_val = t;
                 }
@@ -302,7 +308,7 @@ __global__ void flash_attention_kernel(
     }
     
     // 用 l_shared 做归一化，并把结果写回全局内存
-    // o_shared 存的是未归一化的累积值，这里统一除以 l_shared
+    // o_shared[q_block_len, head_dim]存的是未归一化的累积值，这里统一除以 l_shared[q_block_len]
     for (int idx = tid; idx < q_block_len * head_dim; idx += num_threads) {
         int q_idx = idx / head_dim;
         int d_idx = idx % head_dim;

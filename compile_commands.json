@@ -1,0 +1,1 @@
+[{"directory":"/home/wgreymon/Learning-CUDA","command":"nvcc -std=c++17 -O0 -DPLATFORM_NVIDIA -c src/kernels.cu -o src/kernels.o -I/usr/local/cuda-13.1/include -I/usr/local/cuda-13.1/targets/x86_64-linux/include -I/home/wgreymon/Learning-CUDA/tester -I/home/wgreymon/Learning-CUDA/src","file":"src/kernels.cu"}]
