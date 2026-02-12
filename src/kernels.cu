@@ -1,6 +1,25 @@
 #include <vector>
+#include <type_traits>
 #include <cuda_fp16.h>
 #include "../tester/utils.h"
+
+template <typename A>
+__device__ __forceinline__ A acc_fmax(A a, A b) {
+    if constexpr (std::is_same_v<A, double>) {
+        return fmax(a, b);
+    } else {
+        return fmaxf(a, b);
+    }
+}
+
+template <typename A>
+__device__ __forceinline__ A acc_exp(A x) {
+    if constexpr (std::is_same_v<A, double>) {
+        return exp(x);
+    } else {
+        return __expf(x);
+    }
+}
 
 template <typename T>
 __global__ void trace_kernel(const T* __restrict__ input,
@@ -127,33 +146,36 @@ __global__ void flash_attention_kernel(
     T* v_shared = reinterpret_cast<T*>(shared_mem + offset);
     offset += block_size_kv * head_dim * sizeof(T);
     
-    // s_shared[block_size_q, block_size_kv]: 当前Q/KV tile的所有score，用doulbe存储，避免精度丢失
-    offset = (offset + sizeof(double) - 1) / sizeof(double) * sizeof(double);  // 对齐到double的边界，避免多次访存
-    double* s_shared = reinterpret_cast<double*>(shared_mem + offset);
-    offset += block_size_q * block_size_kv * sizeof(double);
+    using Accum = typename std::conditional<std::is_same<T, float>::value, double, float>::type;
+
+    // s_shared[block_size_q, block_size_kv]: 当前Q/KV tile的所有score
+    offset = (offset + sizeof(Accum) - 1) / sizeof(Accum) * sizeof(Accum);
+    Accum* s_shared = reinterpret_cast<Accum*>(shared_mem + offset);
+    offset += block_size_q * block_size_kv * sizeof(Accum);
     
-    // o_shared[block_size_q, head_dim]: 当前Q位置、head维度的未归一化输出累计值，用double存储，避免精度丢失
-    offset = (offset + sizeof(double) - 1) / sizeof(double) * sizeof(double);
-    double* o_shared = reinterpret_cast<double*>(shared_mem + offset);
-    offset += block_size_q * head_dim * sizeof(double);
+    // o_shared[block_size_q, head_dim]: 当前Q位置、head维度的未归一化输出累计值
+    offset = (offset + sizeof(Accum) - 1) / sizeof(Accum) * sizeof(Accum);
+    Accum* o_shared = reinterpret_cast<Accum*>(shared_mem + offset);
+    offset += block_size_q * head_dim * sizeof(Accum);
     
     // online softmax对应当前全局最大的logit
-    offset = (offset + sizeof(double) - 1) / sizeof(double) * sizeof(double);
-    double* m_shared = reinterpret_cast<double*>(shared_mem + offset);
-    offset += block_size_q * sizeof(double);
+    offset = (offset + sizeof(Accum) - 1) / sizeof(Accum) * sizeof(Accum);
+    Accum* m_shared = reinterpret_cast<Accum*>(shared_mem + offset);
+    offset += block_size_q * sizeof(Accum);
     
     // online softmax对应的当前全局归一化分母
-    double* l_shared = reinterpret_cast<double*>(shared_mem + offset);
+    Accum* l_shared = reinterpret_cast<Accum*>(shared_mem + offset);
+
     
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
     // 初始化m，l，o
     for (int idx = tid; idx < q_block_len; idx += num_threads) {
-        m_shared[idx] = -INFINITY;
-        l_shared[idx] = 0.0;
+        m_shared[idx] = static_cast<Accum>(-INFINITY);
+        l_shared[idx] = static_cast<Accum>(0);
         for (int d = 0; d < head_dim; d++) {
-            o_shared[idx * head_dim + d] = 0.0;  // 未归一化的输出累加器（double）
+            o_shared[idx * head_dim + d] = static_cast<Accum>(0);  // 未归一化的输出累加器
         }
     }
     __syncthreads();
@@ -181,7 +203,7 @@ __global__ void flash_attention_kernel(
         const int kv_start = kv_block_idx * block_size_kv;
         const int kv_end = min(kv_start + block_size_kv, src_seq_len);
         const int kv_block_len = kv_end - kv_start;
-        const double scale_d = static_cast<double>(scale);
+        const Accum scale_acc = static_cast<Accum>(scale);
         
         // 内循环：加载当前KV tile[kv_block_len, head_dim]到shared memory
         for (int idx = tid; idx < kv_block_len * head_dim; idx += num_threads) {
@@ -204,7 +226,7 @@ __global__ void flash_attention_kernel(
         }
         __syncthreads();
         
-        // 计算局部score：Qtile[q_block_len, head_dim] * Ktile^T[head_dim, kv_block_len] = Score[q_block_len, kv_block_len]
+        // 计算局部score：Qtile[q_block_len, head_dim] * Ktile^T[head_dim, kv_block_len]
         for (int idx = tid; idx < q_block_len * kv_block_len; idx += num_threads) {
             int q_idx = idx / kv_block_len;
             int kv_idx = idx % kv_block_len;
@@ -213,23 +235,23 @@ __global__ void flash_attention_kernel(
             bool mask = (is_causal && global_q_idx < global_kv_idx);
 
             if (mask) {
-                s_shared[q_idx * block_size_kv + kv_idx] = -INFINITY;
+                s_shared[q_idx * block_size_kv + kv_idx] = static_cast<Accum>(-INFINITY);
                 continue;
             }
 
-            // 内层遍历整个head_dim，计算score
-            float sum = 0.0;
+            float sum = 0.0f;
+            const int q_base = q_idx * head_dim;
+            const int k_base = kv_idx * head_dim;
             for (int d = 0; d < head_dim; d++) {
-                float q_val = static_cast<float>(q_shared[q_idx * head_dim + d]);
-                float k_val = static_cast<float>(k_shared[kv_idx * head_dim + d]);
+                float q_val = static_cast<float>(q_shared[q_base + d]);
+                float k_val = static_cast<float>(k_shared[k_base + d]);
                 sum += q_val * k_val;
             }
-            s_shared[q_idx * block_size_kv + kv_idx] = sum * scale_d;
+            s_shared[q_idx * block_size_kv + kv_idx] = static_cast<Accum>(sum) * scale_acc;
         }
         __syncthreads();
         
         // ─────────────────────────────────────────────────────────────────
-        // softmax(Score[q_block_len, kv_block_len])
         // Online softmax：每处理一个 KV tile，增量更新 m/l/o
         // 流程：① 取当前 tile 的 max → ② 算 rescaling 因子 alpha
         //      ③ 累加 p_sum（softmax 分母）→ ④ 累加 o（softmax 分子 × V）
@@ -238,64 +260,46 @@ __global__ void flash_attention_kernel(
             int global_q_idx = q_start + q_idx;
 
             // ① 读取上一 tile 的状态
-            double m_old = m_shared[q_idx];
-            double l_old = l_shared[q_idx];
+            Accum m_old = m_shared[q_idx];
+            Accum l_old = l_shared[q_idx];
 
             // ② 当前 tile 内的 max
-            double m_ij = -static_cast<double>(INFINITY);
+            Accum m_ij = static_cast<Accum>(-INFINITY);
+            const int score_row = q_idx * block_size_kv;
             for (int kv_idx = 0; kv_idx < kv_block_len; kv_idx++) {
                 int global_kv_idx = kv_start + kv_idx;
                 if (is_causal && global_q_idx < global_kv_idx) continue;
-                double s_val = s_shared[q_idx * block_size_kv + kv_idx];
-                m_ij = fmax(m_ij, s_val);
+                Accum s_val = s_shared[score_row + kv_idx];
+                m_ij = acc_fmax(m_ij, s_val);
             }
 
-            double m_new = fmax(m_old, m_ij);
-            if (m_new == -INFINITY) continue;
+            Accum m_new = acc_fmax(m_old, m_ij);
+            if (m_new == static_cast<Accum>(-INFINITY)) continue;
 
             // ③ rescaling 因子：max 变大时，旧值需整体缩小
-            double alpha = exp(m_old - m_new);
+            Accum alpha = acc_exp(m_old - m_new);
 
-            // ④ 计算并缓存 p_ij = exp(s_ij - m_new)
-            //    然后复用 p_ij 同时完成分母 p_sum 的累加，避免在后续 O 累加里重复计算 exp()
-            const int score_row = q_idx * block_size_kv;
-            double p_sum = 0.0;
-            double p_err = 0.0;
+            // 计算并缓存 p_ij = exp(s_ij - m_new)
+            Accum p_sum = static_cast<Accum>(0);
             for (int kv_idx = 0; kv_idx < kv_block_len; kv_idx++) {
                 const int global_kv_idx = kv_start + kv_idx;
                 if (is_causal && global_q_idx < global_kv_idx) {
-                    // masked 的位置等价于 exp(-inf) = 0
-                    s_shared[score_row + kv_idx] = 0.0;
+                    s_shared[score_row + kv_idx] = static_cast<Accum>(0);
                     continue;
                 }
-                const double p_ij = exp(s_shared[score_row + kv_idx] - m_new);
+                const Accum p_ij = acc_exp(s_shared[score_row + kv_idx] - m_new);
                 s_shared[score_row + kv_idx] = p_ij;
-                // Kahan summation for p_sum
-                const double y = p_ij - p_err;
-                const double t = p_sum + y;
-                p_err = (t - p_sum) - y;
-                p_sum = t;
+                p_sum += p_ij;
             }
 
-            // ⑤ o_new = alpha * o_old + Σ p_ij * v，当前 tile 的输出贡献（Kahan 累加）
-            // 对于block_score[q_block_len, kv_block_len] * V[kv_block_len, head_dim]固定一个q_idx，计算[kv_block_len]列的贡献
-            // :即[kv_block_len] * V[kv_block_len, head_dim]
-            // 在最外层对kv维度进行了切分kv_block_idx < num_kv_blocks，多次累计，就能
+            // ⑤ o_new = alpha * o_old + Σ p_ij * v
             for (int d = 0; d < head_dim; d++) {
-                // 重标定：历史所有 tile 的分子从旧基准 m_old 统一“换算”到了新基准 m_new
-                double o_new_val = alpha * o_shared[q_idx * head_dim + d];
-                double o_err = 0.0;
-                // 把当前tile的新贡献累加到o_new_val中
+                Accum o_new_val = alpha * o_shared[q_idx * head_dim + d];
                 for (int kv_idx = 0; kv_idx < kv_block_len; kv_idx++) {
                     const int global_kv_idx = kv_start + kv_idx;
                     if (is_causal && global_q_idx < global_kv_idx) continue;
-                    // 复用缓存的 p_ij（已写回 s_shared）
-                    const double p_ij = s_shared[score_row + kv_idx];   // 已经是 exp(s_ij - m_new)
-                    const double term = p_ij * static_cast<double>(v_shared[kv_idx * head_dim + d]);
-                    const double y = term - o_err;
-                    const double t = o_new_val + y;      // 在历史的KV tile上累加，最终得到全局结果
-                    o_err = (t - o_new_val) - y;
-                    o_new_val = t;
+                    const Accum p_ij = s_shared[score_row + kv_idx];
+                    o_new_val += p_ij * static_cast<Accum>(v_shared[kv_idx * head_dim + d]);
                 }
                 o_shared[q_idx * head_dim + d] = o_new_val;
             }
@@ -314,9 +318,9 @@ __global__ void flash_attention_kernel(
         int d_idx = idx % head_dim;
         int global_q_idx = q_start + q_idx;
         
-        if (global_q_idx < tgt_seq_len && l_shared[q_idx] > 0.0) {
-            double o_unnorm = o_shared[idx];
-            double o_val = o_unnorm / l_shared[q_idx];
+        if (global_q_idx < tgt_seq_len && l_shared[q_idx] > static_cast<Accum>(0)) {
+            Accum o_unnorm = o_shared[idx];
+            Accum o_val = o_unnorm / l_shared[q_idx];
             int offset = batch_idx * tgt_seq_len * query_heads * head_dim +
                         global_q_idx * query_heads * head_dim +
                         q_head_idx * head_dim + d_idx;
@@ -380,23 +384,23 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice));
     RUNTIME_CHECK(cudaMemset(d_o, 0, o_size));
     
-    // float 和 half 都使用 double 作为中间量以保证精度
-    // 计算转成double所需的空间
-    auto align_double = [](size_t x) {
-        return (x + sizeof(double) - 1) / sizeof(double) * sizeof(double);
+    // float: Accum=double；half: Accum=float
+    using Accum = std::conditional_t<std::is_same_v<T, float>, double, float>;
+    auto align_accum = [](size_t x) {
+        return (x + sizeof(Accum) - 1) / sizeof(Accum) * sizeof(Accum);
     };
     auto smem_needed = [&](int bq, int bkv) {
         size_t off = 0;
         off += (static_cast<size_t>(bq) + 2ull * static_cast<size_t>(bkv)) *
                static_cast<size_t>(head_dim) * sizeof(T); // Q/K/V
-        off = align_double(off);
+        off = align_accum(off);
         off += static_cast<size_t>(bq) * static_cast<size_t>(bkv) *
-               sizeof(double);                              // scores
-        off = align_double(off);
+               sizeof(Accum);                              // scores
+        off = align_accum(off);
         off += static_cast<size_t>(bq) * static_cast<size_t>(head_dim) *
-               sizeof(double);                              // o accumulator
-        off = align_double(off);
-        off += 2ull * static_cast<size_t>(bq) * sizeof(double); // m / l
+               sizeof(Accum);                              // o accumulator
+        off = align_accum(off);
+        off += 2ull * static_cast<size_t>(bq) * sizeof(Accum); // m / l
         return off;
     };
 
@@ -427,7 +431,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     
     const int num_q_blocks = (target_seq_len + block_size_q - 1) / block_size_q;
     dim3 grid(num_q_blocks, query_heads, batch_size);
-    dim3 block(256);  // 每个 block 的线程数
+    dim3 block(256);
     
     // 统一使用 Flash Attention kernel（float 和 half 都使用 double 作为中间量）
     flash_attention_kernel<T><<<grid, block, shared_mem_size>>>(
